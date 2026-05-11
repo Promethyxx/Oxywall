@@ -1,14 +1,18 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use dotenvy::dotenv;
 use rand::seq::SliceRandom;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::fs::{create_dir_all, File};
 use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, Duration};
+
+pub const LOGO_DARK: &[u8] = include_bytes!("../assets/Oxywall_dark.png");
+pub const LOGO_LIGHT: &[u8] = include_bytes!("../assets/Oxywall_light.png");
+pub const LOGO_ICON_PNG: &[u8] = include_bytes!("../assets/Oxywall_icon.png");
 
 // -----------------------------------------------------------------------------
 // Constantes
@@ -252,7 +256,8 @@ async fn fetch_pixabay(client: &Client, query: &str, max_photos: usize, api_key:
         }
 
         let data: PixabaySearch = resp.json().await?;
-        if data.hits.is_empty() {
+        let hits_len = data.hits.len();
+        if hits_len == 0 {
             break;
         }
 
@@ -271,7 +276,7 @@ async fn fetch_pixabay(client: &Client, query: &str, max_photos: usize, api_key:
             }
         }
 
-        if data.hits.len() < 200 {
+        if hits_len < 200 {
             break;
         }
         page += 1;
@@ -322,7 +327,7 @@ async fn download_all(client: &Client, query: &str, max_per_source: usize, alrea
     println!("\n📦 {} nouvelles images à télécharger\n", unique.len());
 
     let mut downloaded = 0;
-    for (idx, img) in unique.iter().enumerate() {
+    for (_idx, img) in unique.iter().enumerate() {
         let filename = folder.join(format!("{}_{}.jpg", img.id, img.dim_str()));
         let response = client.get(&img.url).send().await?;
         if response.status().is_success() {
@@ -343,7 +348,7 @@ async fn download_all(client: &Client, query: &str, max_per_source: usize, alrea
 }
 
 // -----------------------------------------------------------------------------
-// Thèmes
+// Thèmes (via lazy_static)
 // -----------------------------------------------------------------------------
 lazy_static::lazy_static! {
     static ref THEMES: Vec<(&'static str, Vec<&'static str>)> = vec![
@@ -494,4 +499,5 @@ async fn main() -> Result<()> {
     println!("=======================================================");
 
     Ok(())
+    
 }
