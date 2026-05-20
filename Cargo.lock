@@ -3,6 +3,21 @@
 version = 4
 
 [[package]]
+name = "Oxywall"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dotenvy",
+ "lazy_static",
+ "rand 0.10.1",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "winres",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -754,21 +769,6 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
-
-[[package]]
-name = "oxyw_rust"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dotenvy",
- "lazy_static",
- "rand 0.10.1",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "winres",
-]
 
 [[package]]
 name = "parking_lot"
