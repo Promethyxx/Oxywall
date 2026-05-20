@@ -1,12 +1,12 @@
 use anyhow::Result;
 use dotenvy::dotenv;
-use rand::seq::SliceRandom;
+use rand::prelude::IndexedRandom; // <-- CORRECTION: Nouveau trait pour rand 0.10
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::env;
 use std::path::Path;
-use tokio::fs::{create_dir_all, File};
+use tokio::fs::{create_dir_all, File, OpenOptions}; // <-- CORRECTION: OpenOptions pour l'append
 use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, Duration};
 
@@ -95,7 +95,6 @@ impl Image {
         format!("{}x{}", self.width, self.height)
     }
 
-    // Vérifie si les dimensions sont valides
     fn is_valid_size(&self) -> bool {
         VALID_SIZES.contains(&(self.width, self.height))
     }
@@ -116,7 +115,7 @@ async fn load_log() -> Result<HashSet<String>> {
 
 async fn save_log(id: &str) -> Result<()> {
     let path = Path::new(LOG_FILE);
-    let mut file = File::options()
+    let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
@@ -133,17 +132,19 @@ async fn fetch_pexels(client: &Client, query: &str, max_photos: usize, api_key: 
     let mut found = Vec::new();
     let mut page = 1;
 
+    // CORRECTION : Encodage basique des espaces pour l'URL
+    let encoded_query = query.replace(' ', "%20");
+
     while found.len() < max_photos {
-        let url = "https://api.pexels.com/v1/search";
+        // CORRECTION : Contournement du problème .query() en formatant l'URL directement
+        let url = format!(
+            "https://api.pexels.com/v1/search?query={}&per_page=80&page={}&orientation=landscape",
+            encoded_query, page
+        );
+        
         let resp = client
-            .get(url)
+            .get(&url)
             .header("Authorization", api_key)
-            .query(&[
-                ("query", query),
-                ("per_page", "80"),
-                ("page", &page.to_string()),
-                ("orientation", "landscape"),
-            ])
             .send()
             .await?;
 
@@ -185,17 +186,16 @@ async fn fetch_unsplash(client: &Client, query: &str, max_photos: usize, api_key
     let mut found = Vec::new();
     let mut page = 1;
 
+    let encoded_query = query.replace(' ', "%20");
+
     while found.len() < max_photos {
-        let url = "https://api.unsplash.com/search/photos";
+        let url = format!(
+            "https://api.unsplash.com/search/photos?query={}&per_page=30&page={}&orientation=landscape&client_id={}",
+            encoded_query, page, api_key
+        );
+
         let resp = client
-            .get(url)
-            .query(&[
-                ("query", query),
-                ("per_page", "30"),
-                ("page", &page.to_string()),
-                ("orientation", "landscape"),
-                ("client_id", api_key),
-            ])
+            .get(&url)
             .send()
             .await?;
 
@@ -234,19 +234,16 @@ async fn fetch_pixabay(client: &Client, query: &str, max_photos: usize, api_key:
     let mut found = Vec::new();
     let mut page = 1;
 
+    let encoded_query = query.replace(' ', "%20");
+
     while found.len() < max_photos {
-        let url = "https://pixabay.com/api/";
+        let url = format!(
+            "https://pixabay.com/api/?key={}&q={}&image_type=photo&orientation=horizontal&per_page=200&page={}&safesearch=true",
+            api_key, encoded_query, page
+        );
+
         let resp = client
-            .get(url)
-            .query(&[
-                ("key", api_key),
-                ("q", query),
-                ("image_type", "photo"),
-                ("orientation", "horizontal"),
-                ("per_page", "200"),
-                ("page", &page.to_string()),
-                ("safesearch", "true"),
-            ])
+            .get(&url)
             .send()
             .await?;
 
@@ -450,7 +447,19 @@ lazy_static::lazy_static! {
 // -----------------------------------------------------------------------------
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv().ok(); // charge .env
+    // -------------------------------------------------------------------------
+    // Résolution robuste du .env
+    // -------------------------------------------------------------------------
+    let current_cwd_env = env::current_dir().unwrap_or_default().join(".env");
+    let exe_dir_env = env::current_exe().unwrap_or_default().parent().unwrap_or(Path::new("")).join(".env");
+
+    if current_cwd_env.exists() {
+        dotenvy::from_path(&current_cwd_env).ok();
+    } else if exe_dir_env.exists() {
+        dotenvy::from_path(&exe_dir_env).ok();
+    } else {
+        dotenv().ok(); // Fallback par défaut
+    }
 
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
@@ -461,11 +470,10 @@ async fn main() -> Result<()> {
     println!("  3840x2160 / 1920x1080 strict");
     println!("=======================================================");
 
-    // Charger le log existant
     let already = load_log().await?;
 
-    // Pioche 3 thèmes maîtres au hasard
-    let mut rng = rand::thread_rng();
+    // CORRECTION : nouvelle méthode de RNG pour rand 0.10
+    let mut rng = rand::rng();
     let masters: Vec<&str> = THEMES
         .choose_multiple(&mut rng, MASTER_THEMES)
         .map(|(name, _)| *name)
@@ -476,9 +484,7 @@ async fn main() -> Result<()> {
     let mut total_downloaded = 0;
 
     for master in masters {
-        // Récupérer la liste des sous-thèmes du thème maître
         let subs = THEMES.iter().find(|(name, _)| *name == master).map(|(_, subs)| subs).unwrap();
-        // Piocher 5 déclinaisons
         let picked: Vec<&str> = subs.choose_multiple(&mut rng, SUB_PER_THEME).copied().collect();
 
         println!("\n───────────────────────────────────────────────────────");
@@ -499,5 +505,4 @@ async fn main() -> Result<()> {
     println!("=======================================================");
 
     Ok(())
-    
 }
