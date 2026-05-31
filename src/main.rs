@@ -1,15 +1,20 @@
 use anyhow::Result;
 use dotenvy::dotenv;
-use rand::prelude::IndexedRandom; // <-- CORRECTION: Nouveau trait pour rand 0.10
+use eframe::egui;
+use rand::prelude::IndexedRandom;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::env;
 use std::path::Path;
-use tokio::fs::{create_dir_all, File, OpenOptions}; // <-- CORRECTION: OpenOptions pour l'append
+use std::sync::mpsc;
+use tokio::fs::{create_dir_all, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, Duration};
 
+// -----------------------------------------------------------------------------
+// Assets embarqués
+// -----------------------------------------------------------------------------
 pub const LOGO_DARK: &[u8] = include_bytes!("../assets/Oxywall_dark.png");
 pub const LOGO_LIGHT: &[u8] = include_bytes!("../assets/Oxywall_light.png");
 pub const LOGO_ICON_PNG: &[u8] = include_bytes!("../assets/Oxywall_icon.png");
@@ -21,9 +26,8 @@ const OUTPUT_DIR: &str = "wallpapers";
 const LOG_FILE: &str = "wallpapers/downloaded.txt";
 const MASTER_THEMES: usize = 3;
 const SUB_PER_THEME: usize = 5;
-
-// Dimensions valides : 3840x2160 ou 1920x1080
 const VALID_SIZES: [(u32, u32); 2] = [(3840, 2160), (1920, 1080)];
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // -----------------------------------------------------------------------------
 // Structures pour les réponses API
@@ -71,6 +75,7 @@ struct PixabaySearch {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(non_snake_case)]
 struct PixabayHit {
     id: u32,
     imageWidth: u32,
@@ -101,7 +106,7 @@ impl Image {
 }
 
 // -----------------------------------------------------------------------------
-// Gestion du log des IDs déjà téléchargés
+// Log des IDs déjà téléchargés
 // -----------------------------------------------------------------------------
 async fn load_log() -> Result<HashSet<String>> {
     let path = Path::new(LOG_FILE);
@@ -109,7 +114,11 @@ async fn load_log() -> Result<HashSet<String>> {
         return Ok(HashSet::new());
     }
     let content = tokio::fs::read_to_string(path).await?;
-    let ids: HashSet<String> = content.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let ids: HashSet<String> = content
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     Ok(ids)
 }
 
@@ -125,39 +134,35 @@ async fn save_log(id: &str) -> Result<()> {
 }
 
 // -----------------------------------------------------------------------------
-// Fonctions de fetch par source
+// Fetch Pexels
 // -----------------------------------------------------------------------------
-async fn fetch_pexels(client: &Client, query: &str, max_photos: usize, api_key: &str) -> Result<Vec<Image>> {
-    println!("  [Pexels] '{}'", query);
+async fn fetch_pexels(
+    client: &Client,
+    query: &str,
+    max_photos: usize,
+    api_key: &str,
+) -> Result<Vec<Image>> {
     let mut found = Vec::new();
     let mut page = 1;
-
-    // CORRECTION : Encodage basique des espaces pour l'URL
     let encoded_query = query.replace(' ', "%20");
 
     while found.len() < max_photos {
-        // CORRECTION : Contournement du problème .query() en formatant l'URL directement
         let url = format!(
             "https://api.pexels.com/v1/search?query={}&per_page=80&page={}&orientation=landscape",
             encoded_query, page
         );
-        
         let resp = client
             .get(&url)
             .header("Authorization", api_key)
             .send()
             .await?;
-
         if !resp.status().is_success() {
-            println!("  [Pexels] Erreur HTTP {}", resp.status());
             break;
         }
-
         let data: PexelsSearch = resp.json().await?;
         if data.photos.is_empty() {
             break;
         }
-
         for p in data.photos {
             let img = Image {
                 id: format!("pexels_{}", p.id),
@@ -169,23 +174,26 @@ async fn fetch_pexels(client: &Client, query: &str, max_photos: usize, api_key: 
                 found.push(img);
             }
         }
-
         if data.next_page.is_none() {
             break;
         }
         page += 1;
         sleep(Duration::from_millis(200)).await;
     }
-
-    println!("  [Pexels] {} images valides trouvées", found.len());
     Ok(found.into_iter().take(max_photos).collect())
 }
 
-async fn fetch_unsplash(client: &Client, query: &str, max_photos: usize, api_key: &str) -> Result<Vec<Image>> {
-    println!("  [Unsplash] '{}'", query);
+// -----------------------------------------------------------------------------
+// Fetch Unsplash
+// -----------------------------------------------------------------------------
+async fn fetch_unsplash(
+    client: &Client,
+    query: &str,
+    max_photos: usize,
+    api_key: &str,
+) -> Result<Vec<Image>> {
     let mut found = Vec::new();
     let mut page = 1;
-
     let encoded_query = query.replace(' ', "%20");
 
     while found.len() < max_photos {
@@ -193,26 +201,21 @@ async fn fetch_unsplash(client: &Client, query: &str, max_photos: usize, api_key
             "https://api.unsplash.com/search/photos?query={}&per_page=30&page={}&orientation=landscape&client_id={}",
             encoded_query, page, api_key
         );
-
-        let resp = client
-            .get(&url)
-            .send()
-            .await?;
-
+        let resp = client.get(&url).send().await?;
         if !resp.status().is_success() {
-            println!("  [Unsplash] Erreur HTTP {}", resp.status());
             break;
         }
-
         let data: UnsplashSearch = resp.json().await?;
         if data.results.is_empty() {
             break;
         }
-
         for p in data.results {
             let img = Image {
                 id: format!("unsplash_{}", p.id),
-                url: format!("{}&w={}&h={}&fit=max&fm=jpg&q=100", p.urls.raw, p.width, p.height),
+                url: format!(
+                    "{}&w={}&h={}&fit=max&fm=jpg&q=100",
+                    p.urls.raw, p.width, p.height
+                ),
                 width: p.width,
                 height: p.height,
             };
@@ -220,20 +223,23 @@ async fn fetch_unsplash(client: &Client, query: &str, max_photos: usize, api_key
                 found.push(img);
             }
         }
-
         page += 1;
         sleep(Duration::from_millis(200)).await;
     }
-
-    println!("  [Unsplash] {} images valides trouvées", found.len());
     Ok(found.into_iter().take(max_photos).collect())
 }
 
-async fn fetch_pixabay(client: &Client, query: &str, max_photos: usize, api_key: &str) -> Result<Vec<Image>> {
-    println!("  [Pixabay] '{}'", query);
+// -----------------------------------------------------------------------------
+// Fetch Pixabay
+// -----------------------------------------------------------------------------
+async fn fetch_pixabay(
+    client: &Client,
+    query: &str,
+    max_photos: usize,
+    api_key: &str,
+) -> Result<Vec<Image>> {
     let mut found = Vec::new();
     let mut page = 1;
-
     let encoded_query = query.replace(' ', "%20");
 
     while found.len() < max_photos {
@@ -241,25 +247,21 @@ async fn fetch_pixabay(client: &Client, query: &str, max_photos: usize, api_key:
             "https://pixabay.com/api/?key={}&q={}&image_type=photo&orientation=horizontal&per_page=200&page={}&safesearch=true",
             api_key, encoded_query, page
         );
-
-        let resp = client
-            .get(&url)
-            .send()
-            .await?;
-
+        let resp = client.get(&url).send().await?;
         if !resp.status().is_success() {
-            println!("  [Pixabay] Erreur HTTP {}", resp.status());
             break;
         }
-
         let data: PixabaySearch = resp.json().await?;
         let hits_len = data.hits.len();
         if hits_len == 0 {
             break;
         }
-
         for p in data.hits {
-            let url = p.largeImageURL.as_ref().or(p.webformatURL.as_ref()).map(|s| s.to_string());
+            let url = p
+                .largeImageURL
+                .as_ref()
+                .or(p.webformatURL.as_ref())
+                .map(|s| s.to_string());
             if let Some(url) = url {
                 let img = Image {
                     id: format!("pixabay_{}", p.id),
@@ -272,59 +274,66 @@ async fn fetch_pixabay(client: &Client, query: &str, max_photos: usize, api_key:
                 }
             }
         }
-
         if hits_len < 200 {
             break;
         }
         page += 1;
         sleep(Duration::from_millis(200)).await;
     }
-
-    println!("  [Pixabay] {} images valides trouvées", found.len());
     Ok(found.into_iter().take(max_photos).collect())
 }
 
 // -----------------------------------------------------------------------------
 // Téléchargement pour une requête donnée
 // -----------------------------------------------------------------------------
-async fn download_all(client: &Client, query: &str, max_per_source: usize, already: &HashSet<String>) -> Result<usize> {
+async fn download_all(
+    client: &Client,
+    query: &str,
+    max_per_source: usize,
+    already: &HashSet<String>,
+    log_tx: &mpsc::Sender<String>,
+) -> Result<usize> {
     let folder = Path::new(OUTPUT_DIR).join(query.replace(' ', "_"));
     create_dir_all(&folder).await?;
     create_dir_all(OUTPUT_DIR).await?;
 
-    println!("\n=======================================================");
-    println!("  Recherche : {}", query);
-    println!("  Déjà téléchargés (log) : {}", already.len());
-    println!("=======================================================");
+    let _ = log_tx.send(format!("Searching: {}", query));
 
     let mut sources = Vec::new();
 
     let pexels_key = env::var("PEXELS_API_KEY").unwrap_or_default();
     if !pexels_key.is_empty() {
+        let _ = log_tx.send(format!("  [Pexels] '{}'", query));
         sources.extend(fetch_pexels(client, query, max_per_source, &pexels_key).await?);
+        let _ = log_tx.send(format!("  [Pexels] {} valid images", sources.len()));
     }
 
     let unsplash_key = env::var("UNSPLASH_API_KEY").unwrap_or_default();
     if !unsplash_key.is_empty() {
+        let before = sources.len();
+        let _ = log_tx.send(format!("  [Unsplash] '{}'", query));
         sources.extend(fetch_unsplash(client, query, max_per_source, &unsplash_key).await?);
+        let _ = log_tx.send(format!("  [Unsplash] {} valid images", sources.len() - before));
     }
 
     let pixabay_key = env::var("PIXABAY_API_KEY").unwrap_or_default();
     if !pixabay_key.is_empty() {
+        let before = sources.len();
+        let _ = log_tx.send(format!("  [Pixabay] '{}'", query));
         sources.extend(fetch_pixabay(client, query, max_per_source, &pixabay_key).await?);
+        let _ = log_tx.send(format!("  [Pixabay] {} valid images", sources.len() - before));
     }
 
-    // Dédoublonnage et filtre log
     let mut seen = HashSet::new();
     let unique: Vec<Image> = sources
         .into_iter()
         .filter(|img| !already.contains(&img.id) && seen.insert(img.id.clone()))
         .collect();
 
-    println!("\n📦 {} nouvelles images à télécharger\n", unique.len());
+    let _ = log_tx.send(format!("{} new images to download", unique.len()));
 
     let mut downloaded = 0;
-    for (_idx, img) in unique.iter().enumerate() {
+    for img in &unique {
         let filename = folder.join(format!("{}_{}.jpg", img.id, img.dim_str()));
         let response = client.get(&img.url).send().await?;
         if response.status().is_success() {
@@ -333,19 +342,29 @@ async fn download_all(client: &Client, query: &str, max_per_source: usize, alrea
             file.write_all(&bytes).await?;
             save_log(&img.id).await?;
             downloaded += 1;
-            println!("  ✅ [{}/{}] {} — {}", downloaded, unique.len(), img.dim_str(), img.id);
+            let _ = log_tx.send(format!(
+                "  ✅ [{}/{}] {} — {}",
+                downloaded,
+                unique.len(),
+                img.dim_str(),
+                img.id
+            ));
         } else {
-            println!("  ⚠️  HTTP {} — {}", response.status(), img.id);
+            let _ = log_tx.send(format!("  ⚠️  HTTP {} — {}", response.status(), img.id));
         }
         sleep(Duration::from_millis(100)).await;
     }
 
-    println!("\n✅ {} nouveaux wallpapers dans '{}'", downloaded, folder.display());
+    let _ = log_tx.send(format!(
+        "✅ {} new wallpapers in '{}'",
+        downloaded,
+        folder.display()
+    ));
     Ok(downloaded)
 }
 
 // -----------------------------------------------------------------------------
-// Thèmes (via lazy_static)
+// Thèmes
 // -----------------------------------------------------------------------------
 lazy_static::lazy_static! {
     static ref THEMES: Vec<(&'static str, Vec<&'static str>)> = vec![
@@ -443,66 +462,369 @@ lazy_static::lazy_static! {
 }
 
 // -----------------------------------------------------------------------------
-// Main
+// Core download logic (called from GUI thread via spawn_blocking)
 // -----------------------------------------------------------------------------
-#[tokio::main]
-async fn main() -> Result<()> {
-    // -------------------------------------------------------------------------
-    // Résolution robuste du .env
-    // -------------------------------------------------------------------------
-    let current_cwd_env = env::current_dir().unwrap_or_default().join(".env");
-    let exe_dir_env = env::current_exe().unwrap_or_default().parent().unwrap_or(Path::new("")).join(".env");
+fn run_download(log_tx: mpsc::Sender<String>) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
 
-    if current_cwd_env.exists() {
-        dotenvy::from_path(&current_cwd_env).ok();
-    } else if exe_dir_env.exists() {
-        dotenvy::from_path(&exe_dir_env).ok();
-    } else {
-        dotenv().ok(); // Fallback par défaut
-    }
+    rt.block_on(async move {
+        // Resolve .env
+        let current_cwd_env = env::current_dir().unwrap_or_default().join(".env");
+        let exe_dir_env = env::current_exe()
+            .unwrap_or_default()
+            .parent()
+            .unwrap_or(Path::new(""))
+            .join(".env");
+        if current_cwd_env.exists() {
+            dotenvy::from_path(&current_cwd_env).ok();
+        } else if exe_dir_env.exists() {
+            dotenvy::from_path(&exe_dir_env).ok();
+        } else {
+            dotenv().ok();
+        }
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
+        let client = match Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = log_tx.send(format!("❌ HTTP client error: {}", e));
+                return;
+            }
+        };
 
-    println!("=======================================================");
-    println!("  Wallpaper Downloader — Mode aléatoire (Rust)");
-    println!("  3840x2160 / 1920x1080 strict");
-    println!("=======================================================");
+        let already = match load_log().await {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = log_tx.send(format!("❌ Log read error: {}", e));
+                return;
+            }
+        };
 
-    let already = load_log().await?;
+        let mut rng = rand::rng();
+        let masters: Vec<&str> = THEMES
+            .sample(&mut rng, MASTER_THEMES)
+            .map(|(name, _)| *name)
+            .collect();
 
-    // CORRECTION : nouvelle méthode de RNG pour rand 0.10
-    let mut rng = rand::rng();
-    let masters: Vec<&str> = THEMES
-        .choose_multiple(&mut rng, MASTER_THEMES)
-        .map(|(name, _)| *name)
-        .collect();
+        let _ = log_tx.send(format!(
+            "🎲 Selected themes: {}",
+            masters.join(", ")
+        ));
 
-    println!("\n🎲 Thèmes maîtres tirés : {}\n", masters.join(", "));
+        let mut total = 0usize;
 
-    let mut total_downloaded = 0;
+        for master in &masters {
+            let subs = THEMES
+                .iter()
+                .find(|(name, _)| name == master)
+                .map(|(_, subs)| subs)
+                .unwrap();
+            let picked: Vec<&str> = subs
+                .sample(&mut rng, SUB_PER_THEME)
+                .copied()
+                .collect();
 
-    for master in masters {
-        let subs = THEMES.iter().find(|(name, _)| *name == master).map(|(_, subs)| subs).unwrap();
-        let picked: Vec<&str> = subs.choose_multiple(&mut rng, SUB_PER_THEME).copied().collect();
+            let _ = log_tx.send(format!(
+                "─── 🎨 {} — {}",
+                master.to_uppercase(),
+                picked.join(", ")
+            ));
 
-        println!("\n───────────────────────────────────────────────────────");
-        println!("  🎨 {}", master.to_uppercase());
-        println!("  Déclinaisons : {}", picked.join(", "));
-        println!("───────────────────────────────────────────────────────");
+            for sub in picked {
+                match download_all(&client, sub, 50, &already, &log_tx).await {
+                    Ok(n) => total += n,
+                    Err(e) => {
+                        let _ = log_tx.send(format!("❌ Error on '{}': {}", sub, e));
+                    }
+                }
+            }
+        }
 
-        for sub in picked {
-            let n = download_all(&client, sub, 50, &already).await?;
-            total_downloaded += n;
+        let _ = log_tx.send(format!(
+            "🎉 Done! {} new wallpapers total — ./{}/",
+            total, OUTPUT_DIR
+        ));
+    });
+}
+
+// -----------------------------------------------------------------------------
+// GUI — helper: load PNG bytes into an egui TextureHandle
+// -----------------------------------------------------------------------------
+fn load_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> egui::TextureHandle {
+    let image = image::load_from_memory(bytes)
+        .expect("Failed to decode image")
+        .to_rgba8();
+    let (w, h) = image.dimensions();
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        image.as_raw(),
+    );
+    ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR)
+}
+
+// -----------------------------------------------------------------------------
+// GUI — App state
+// -----------------------------------------------------------------------------
+struct OxywallApp {
+    // Theme
+    dark_mode: bool,
+    tex_dark: egui::TextureHandle,
+    tex_light: egui::TextureHandle,
+
+    // API keys (editable in UI)
+    pexels_key: String,
+    unsplash_key: String,
+    pixabay_key: String,
+
+    // Download state
+    is_running: bool,
+    log_lines: Vec<String>,
+    log_rx: Option<mpsc::Receiver<String>>,
+}
+
+impl OxywallApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let ctx = &cc.egui_ctx;
+
+        // Apply initial dark theme
+        ctx.set_visuals(egui::Visuals::dark());
+
+        let tex_dark = load_texture(ctx, "logo_dark", LOGO_DARK);
+        let tex_light = load_texture(ctx, "logo_light", LOGO_LIGHT);
+
+        // Pre-fill keys from env if already set
+        let pexels_key = env::var("PEXELS_API_KEY").unwrap_or_default();
+        let unsplash_key = env::var("UNSPLASH_API_KEY").unwrap_or_default();
+        let pixabay_key = env::var("PIXABAY_API_KEY").unwrap_or_default();
+
+        Self {
+            dark_mode: true,
+            tex_dark,
+            tex_light,
+            pexels_key,
+            unsplash_key,
+            pixabay_key,
+            is_running: false,
+            log_lines: Vec::new(),
+            log_rx: None,
         }
     }
 
-    println!("\n=======================================================");
-    println!("🎉 Terminé ! {} nouveaux wallpapers au total", total_downloaded);
-    println!("📁 Dossier : ./{}/", OUTPUT_DIR);
-    println!("📋 Log : ./{}", LOG_FILE);
-    println!("=======================================================");
+    fn start_download(&mut self, ctx: &egui::Context) {
+        // Push API keys into env so the async functions can read them
+        unsafe {
+            env::set_var("PEXELS_API_KEY", &self.pexels_key);
+            env::set_var("UNSPLASH_API_KEY", &self.unsplash_key);
+            env::set_var("PIXABAY_API_KEY", &self.pixabay_key);
+        }
 
-    Ok(())
+        let (tx, rx) = mpsc::channel::<String>();
+        self.log_rx = Some(rx);
+        self.is_running = true;
+        self.log_lines.clear();
+        self.log_lines.push("Starting download…".to_string());
+
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            run_download(tx);
+            ctx_clone.request_repaint();
+        });
+    }
+}
+
+impl eframe::App for OxywallApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        // Drain log channel
+        if let Some(rx) = &self.log_rx {
+            while let Ok(msg) = rx.try_recv() {
+                if msg.starts_with("🎉") {
+                    self.is_running = false;
+                }
+                self.log_lines.push(msg);
+            }
+        }
+        if self.is_running {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
+
+        // ── Top panel: logo + title + theme toggle ──────────────────────────
+        egui::Panel::top("header")
+            .min_size(72.0)
+            .show_inside(ui, |ui| {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    // Logo (dark or light depending on theme)
+                    let tex = if self.dark_mode {
+                        &self.tex_dark
+                    } else {
+                        &self.tex_light
+                    };
+                    let logo_h = 52.0;
+                    let aspect = tex.size_vec2().x / tex.size_vec2().y;
+                    ui.add(
+                        egui::Image::new(tex)
+                            .fit_to_exact_size(egui::vec2(logo_h * aspect, logo_h)),
+                    );
+
+                    ui.add_space(12.0);
+
+                    // Title + version
+                    ui.vertical(|ui| {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(format!("Oxywall {}", APP_VERSION))
+                                .size(22.0)
+                                .strong(),
+                        );
+                    });
+
+                    // Push theme toggle to the right
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let icon = if self.dark_mode { "☀ Light" } else { "🌙 Dark" };
+                        if ui.button(icon).clicked() {
+                            self.dark_mode = !self.dark_mode;
+                            ctx.set_visuals(if self.dark_mode {
+                                egui::Visuals::dark()
+                            } else {
+                                egui::Visuals::light()
+                            });
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+            });
+
+        // ── Central panel: API keys + Get button + log ──────────────────────
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            ui.add_space(8.0);
+
+            // API Keys section
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(egui::RichText::new("API Keys").strong());
+                ui.add_space(4.0);
+
+                egui::Grid::new("api_keys_grid")
+                    .num_columns(3)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        // Pexels
+                        ui.label("Pexels");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.pexels_key)
+                                .hint_text("PEXELS_API_KEY")
+                                .password(true)
+                                .desired_width(280.0),
+                        );
+                        if ui.button("📋 Copy").clicked() {
+                            ctx.copy_text(self.pexels_key.clone());
+                        }
+                        ui.end_row();
+
+                        // Unsplash
+                        ui.label("Unsplash");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.unsplash_key)
+                                .hint_text("UNSPLASH_ACCESS_KEY")
+                                .password(true)
+                                .desired_width(280.0),
+                        );
+                        if ui.button("📋 Copy").clicked() {
+                            ctx.copy_text(self.unsplash_key.clone());
+                        }
+                        ui.end_row();
+
+                        // Pixabay
+                        ui.label("Pixabay");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.pixabay_key)
+                                .hint_text("PIXABAY_API_KEY")
+                                .password(true)
+                                .desired_width(280.0),
+                        );
+                        if ui.button("📋 Copy").clicked() {
+                            ctx.copy_text(self.pixabay_key.clone());
+                        }
+                        ui.end_row();
+                    });
+            });
+
+            ui.add_space(10.0);
+
+            // Get button
+            ui.horizontal(|ui| {
+                let btn_label = if self.is_running {
+                    "⏳ Running…"
+                } else {
+                    "⬇ Get"
+                };
+                let btn = egui::Button::new(
+                    egui::RichText::new(btn_label).size(16.0),
+                );
+                if ui
+                    .add_enabled(!self.is_running, btn)
+                    .clicked()
+                {
+                    self.start_download(&ctx);
+                }
+
+                if self.is_running {
+                    ui.spinner();
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            // Log output (scrollable)
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for line in &self.log_lines {
+                        ui.label(egui::RichText::new(line).monospace().size(12.0));
+                    }
+                });
+        });
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------------
+fn main() -> eframe::Result {
+    // Build window icon from embedded PNG
+    let icon = {
+        let img = image::load_from_memory(LOGO_ICON_PNG)
+            .expect("icon decode")
+            .to_rgba8();
+        let (w, h) = img.dimensions();
+        egui::IconData {
+            rgba: img.into_raw(),
+            width: w,
+            height: h,
+        }
+    };
+
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(format!("Oxywall {}", APP_VERSION))
+            .with_inner_size([700.0, 520.0])
+            .with_min_inner_size([480.0, 380.0])
+            .with_icon(icon),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Oxywall",
+        native_options,
+        Box::new(|cc| Ok(Box::new(OxywallApp::new(cc)))),
+    )
 }
