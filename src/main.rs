@@ -6,7 +6,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use tokio::fs::{create_dir_all, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
@@ -22,8 +22,6 @@ pub const LOGO_ICON_PNG: &[u8] = include_bytes!("../assets/Oxywall_icon.png");
 // -----------------------------------------------------------------------------
 // Constantes
 // -----------------------------------------------------------------------------
-const OUTPUT_DIR: &str = "wallpapers";
-const LOG_FILE: &str = "wallpapers/downloaded.txt";
 const MASTER_THEMES: usize = 3;
 const SUB_PER_THEME: usize = 5;
 const VALID_SIZES: [(u32, u32); 2] = [(3840, 2160), (1920, 1080)];
@@ -108,12 +106,11 @@ impl Image {
 // -----------------------------------------------------------------------------
 // Log des IDs déjà téléchargés
 // -----------------------------------------------------------------------------
-async fn load_log() -> Result<HashSet<String>> {
-    let path = Path::new(LOG_FILE);
-    if !path.exists() {
+async fn load_log(log_file: &Path) -> Result<HashSet<String>> {
+    if !log_file.exists() {
         return Ok(HashSet::new());
     }
-    let content = tokio::fs::read_to_string(path).await?;
+    let content = tokio::fs::read_to_string(log_file).await?;
     let ids: HashSet<String> = content
         .lines()
         .map(|s| s.trim().to_string())
@@ -122,12 +119,11 @@ async fn load_log() -> Result<HashSet<String>> {
     Ok(ids)
 }
 
-async fn save_log(id: &str) -> Result<()> {
-    let path = Path::new(LOG_FILE);
+async fn save_log(log_file: &Path, id: &str) -> Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(log_file)
         .await?;
     file.write_all(format!("{}\n", id).as_bytes()).await?;
     Ok(())
@@ -292,10 +288,12 @@ async fn download_all(
     max_per_source: usize,
     already: &HashSet<String>,
     log_tx: &mpsc::Sender<String>,
+    output_dir: &Path,
+    log_file: &Path,
 ) -> Result<usize> {
-    let folder = Path::new(OUTPUT_DIR).join(query.replace(' ', "_"));
+    let folder = output_dir.join(query.replace(' ', "_"));
     create_dir_all(&folder).await?;
-    create_dir_all(OUTPUT_DIR).await?;
+    create_dir_all(output_dir).await?;
 
     let _ = log_tx.send(format!("Searching: {}", query));
 
@@ -340,7 +338,7 @@ async fn download_all(
             let bytes = response.bytes().await?;
             let mut file = File::create(&filename).await?;
             file.write_all(&bytes).await?;
-            save_log(&img.id).await?;
+            save_log(log_file, &img.id).await?;
             downloaded += 1;
             let _ = log_tx.send(format!(
                 "  ✅ [{}/{}] {} — {}",
@@ -462,30 +460,28 @@ lazy_static::lazy_static! {
 }
 
 // -----------------------------------------------------------------------------
-// Core download logic (called from GUI thread via spawn_blocking)
+// Messages de contrôle vers le thread download
 // -----------------------------------------------------------------------------
-fn run_download(log_tx: mpsc::Sender<String>) {
+enum DownloadMsg {
+    Log(String),
+    // Signal que les clés ont changé (chargement .env en cours de run — non utilisé ici
+    // mais prévu pour extension future)
+}
+
+// -----------------------------------------------------------------------------
+// Core download logic
+// -----------------------------------------------------------------------------
+fn run_download(
+    log_tx: mpsc::Sender<String>,
+    output_dir: PathBuf,
+    log_file: PathBuf,
+) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
 
     rt.block_on(async move {
-        // Resolve .env
-        let current_cwd_env = env::current_dir().unwrap_or_default().join(".env");
-        let exe_dir_env = env::current_exe()
-            .unwrap_or_default()
-            .parent()
-            .unwrap_or(Path::new(""))
-            .join(".env");
-        if current_cwd_env.exists() {
-            dotenvy::from_path(&current_cwd_env).ok();
-        } else if exe_dir_env.exists() {
-            dotenvy::from_path(&exe_dir_env).ok();
-        } else {
-            dotenv().ok();
-        }
-
         let client = match Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -497,7 +493,7 @@ fn run_download(log_tx: mpsc::Sender<String>) {
             }
         };
 
-        let already = match load_log().await {
+        let already = match load_log(&log_file).await {
             Ok(a) => a,
             Err(e) => {
                 let _ = log_tx.send(format!("❌ Log read error: {}", e));
@@ -511,10 +507,7 @@ fn run_download(log_tx: mpsc::Sender<String>) {
             .map(|(name, _)| *name)
             .collect();
 
-        let _ = log_tx.send(format!(
-            "🎲 Selected themes: {}",
-            masters.join(", ")
-        ));
+        let _ = log_tx.send(format!("🎲 Selected themes: {}", masters.join(", ")));
 
         let mut total = 0usize;
 
@@ -536,7 +529,17 @@ fn run_download(log_tx: mpsc::Sender<String>) {
             ));
 
             for sub in picked {
-                match download_all(&client, sub, 50, &already, &log_tx).await {
+                match download_all(
+                    &client,
+                    sub,
+                    50,
+                    &already,
+                    &log_tx,
+                    &output_dir,
+                    &log_file,
+                )
+                .await
+                {
                     Ok(n) => total += n,
                     Err(e) => {
                         let _ = log_tx.send(format!("❌ Error on '{}': {}", sub, e));
@@ -546,14 +549,15 @@ fn run_download(log_tx: mpsc::Sender<String>) {
         }
 
         let _ = log_tx.send(format!(
-            "🎉 Done! {} new wallpapers total — ./{}/",
-            total, OUTPUT_DIR
+            "🎉 Done! {} new wallpapers total — {}",
+            total,
+            output_dir.display()
         ));
     });
 }
 
 // -----------------------------------------------------------------------------
-// GUI — helper: load PNG bytes into an egui TextureHandle
+// GUI — helper: charger un PNG embarqué en TextureHandle
 // -----------------------------------------------------------------------------
 fn load_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> egui::TextureHandle {
     let image = image::load_from_memory(bytes)
@@ -568,6 +572,15 @@ fn load_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> egui::TextureH
 }
 
 // -----------------------------------------------------------------------------
+// GUI — état du dialog en cours (non-bloquant)
+// -----------------------------------------------------------------------------
+enum DialogPending {
+    None,
+    EnvFile(std::sync::Arc<std::sync::Mutex<Option<Option<PathBuf>>>>),
+    OutputDir(std::sync::Arc<std::sync::Mutex<Option<Option<PathBuf>>>>),
+}
+
+// -----------------------------------------------------------------------------
 // GUI — App state
 // -----------------------------------------------------------------------------
 struct OxywallApp {
@@ -576,10 +589,17 @@ struct OxywallApp {
     tex_dark: egui::TextureHandle,
     tex_light: egui::TextureHandle,
 
-    // API keys (editable in UI)
+    // API keys
     pexels_key: String,
     unsplash_key: String,
     pixabay_key: String,
+
+    // Paths
+    env_path: String,       // chemin du .env affiché
+    output_dir: String,     // dossier de destination
+
+    // Dialog state
+    dialog_pending: DialogPending,
 
     // Download state
     is_running: bool,
@@ -590,14 +610,18 @@ struct OxywallApp {
 impl OxywallApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = &cc.egui_ctx;
-
-        // Apply initial dark theme
         ctx.set_visuals(egui::Visuals::dark());
 
         let tex_dark = load_texture(ctx, "logo_dark", LOGO_DARK);
         let tex_light = load_texture(ctx, "logo_light", LOGO_LIGHT);
 
-        // Pre-fill keys from env if already set
+        // Dossier par défaut : à côté de l'exe
+        let default_output = env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("wallpapers")))
+            .unwrap_or_else(|| PathBuf::from("wallpapers"));
+
+        // Pré-remplir les clés depuis l'env si déjà définies
         let pexels_key = env::var("PEXELS_API_KEY").unwrap_or_default();
         let unsplash_key = env::var("UNSPLASH_API_KEY").unwrap_or_default();
         let pixabay_key = env::var("PIXABAY_API_KEY").unwrap_or_default();
@@ -609,31 +633,126 @@ impl OxywallApp {
             pexels_key,
             unsplash_key,
             pixabay_key,
+            env_path: String::new(),
+            output_dir: default_output.to_string_lossy().into_owned(),
+            dialog_pending: DialogPending::None,
             is_running: false,
             log_lines: Vec::new(),
             log_rx: None,
         }
     }
 
+    /// Charge un fichier .env et met à jour les champs de clés.
+    fn load_env_file(&mut self, path: &Path) {
+        self.env_path = path.to_string_lossy().into_owned();
+        if let Ok(content) = std::fs::read_to_string(path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.starts_with('#') || line.is_empty() {
+                    continue;
+                }
+                if let Some((key, val)) = line.split_once('=') {
+                    let val = val.trim_matches('"').trim_matches('\'').trim();
+                    match key.trim() {
+                        "PEXELS_API_KEY" => self.pexels_key = val.to_string(),
+                        "UNSPLASH_API_KEY" => self.unsplash_key = val.to_string(),
+                        "PIXABAY_API_KEY" => self.pixabay_key = val.to_string(),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     fn start_download(&mut self, ctx: &egui::Context) {
-        // Push API keys into env so the async functions can read them
+        // Injecter les clés dans l'env pour les fonctions async
         unsafe {
             env::set_var("PEXELS_API_KEY", &self.pexels_key);
             env::set_var("UNSPLASH_API_KEY", &self.unsplash_key);
             env::set_var("PIXABAY_API_KEY", &self.pixabay_key);
         }
 
+        let output_dir = PathBuf::from(&self.output_dir);
+        let log_file = output_dir.join("downloaded.txt");
+
         let (tx, rx) = mpsc::channel::<String>();
         self.log_rx = Some(rx);
         self.is_running = true;
         self.log_lines.clear();
-        self.log_lines.push("Starting download…".to_string());
+        self.log_lines.push(format!(
+            "Output dir: {}",
+            output_dir.display()
+        ));
 
         let ctx_clone = ctx.clone();
         std::thread::spawn(move || {
-            run_download(tx);
+            run_download(tx, output_dir, log_file);
             ctx_clone.request_repaint();
         });
+    }
+
+    /// Lance un dialog natif dans un thread séparé et stocke le résultat
+    /// dans un Arc<Mutex<Option<Option<PathBuf>>>> partagé.
+    ///  - None         = dialog encore ouvert
+    ///  - Some(None)   = annulé
+    ///  - Some(Some(p))= chemin choisi
+    fn open_env_dialog(&mut self, ctx: &egui::Context) {
+        let result: std::sync::Arc<std::sync::Mutex<Option<Option<PathBuf>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result_clone = result.clone();
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .add_filter("Env file", &["env", "txt"])
+                .set_title("Open .env file")
+                .pick_file();
+            *result_clone.lock().unwrap() = Some(picked);
+            ctx_clone.request_repaint();
+        });
+        self.dialog_pending = DialogPending::EnvFile(result);
+    }
+
+    fn open_output_dir_dialog(&mut self, ctx: &egui::Context) {
+        let result: std::sync::Arc<std::sync::Mutex<Option<Option<PathBuf>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result_clone = result.clone();
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("Choose wallpaper output folder")
+                .pick_folder();
+            *result_clone.lock().unwrap() = Some(picked);
+            ctx_clone.request_repaint();
+        });
+        self.dialog_pending = DialogPending::OutputDir(result);
+    }
+
+    /// Appeler chaque frame pour récupérer le résultat d'un dialog en cours.
+    fn poll_dialog(&mut self) {
+        let resolved = match &self.dialog_pending {
+            DialogPending::None => return,
+            DialogPending::EnvFile(arc) => {
+                let guard = arc.lock().unwrap();
+                guard.clone().map(|r| (true, r))
+            }
+            DialogPending::OutputDir(arc) => {
+                let guard = arc.lock().unwrap();
+                guard.clone().map(|r| (false, r))
+            }
+        };
+
+        if let Some((is_env, maybe_path)) = resolved {
+            if is_env {
+                if let Some(path) = maybe_path {
+                    self.load_env_file(&path);
+                }
+            } else {
+                if let Some(path) = maybe_path {
+                    self.output_dir = path.to_string_lossy().into_owned();
+                }
+            }
+            self.dialog_pending = DialogPending::None;
+        }
     }
 }
 
@@ -641,7 +760,10 @@ impl eframe::App for OxywallApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // Drain log channel
+        // Récupérer le résultat des dialogs non-bloquants
+        self.poll_dialog();
+
+        // Drainer le channel de logs
         if let Some(rx) = &self.log_rx {
             while let Ok(msg) = rx.try_recv() {
                 if msg.starts_with("🎉") {
@@ -654,28 +776,20 @@ impl eframe::App for OxywallApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
 
-        // ── Top panel: logo + title + theme toggle ──────────────────────────
+        // ── Header ──────────────────────────────────────────────────────────
         egui::Panel::top("header")
             .min_size(72.0)
             .show_inside(ui, |ui| {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    // Logo (dark or light depending on theme)
-                    let tex = if self.dark_mode {
-                        &self.tex_dark
-                    } else {
-                        &self.tex_light
-                    };
+                    let tex = if self.dark_mode { &self.tex_dark } else { &self.tex_light };
                     let logo_h = 52.0;
                     let aspect = tex.size_vec2().x / tex.size_vec2().y;
                     ui.add(
                         egui::Image::new(tex)
                             .fit_to_exact_size(egui::vec2(logo_h * aspect, logo_h)),
                     );
-
                     ui.add_space(12.0);
-
-                    // Title + version
                     ui.vertical(|ui| {
                         ui.add_space(6.0);
                         ui.label(
@@ -684,8 +798,6 @@ impl eframe::App for OxywallApp {
                                 .strong(),
                         );
                     });
-
-                    // Push theme toggle to the right
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let icon = if self.dark_mode { "☀ Light" } else { "🌙 Dark" };
                         if ui.button(icon).clicked() {
@@ -701,11 +813,36 @@ impl eframe::App for OxywallApp {
                 ui.add_space(6.0);
             });
 
-        // ── Central panel: API keys + Get button + log ──────────────────────
+        // ── Corps ────────────────────────────────────────────────────────────
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.add_space(8.0);
 
-            // API Keys section
+            // ── Section : fichier .env ────────────────────────────────────
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(egui::RichText::new("Environment file (.env)").strong());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.env_path)
+                            .hint_text("Path to .env file (optional)")
+                            .desired_width(ui.available_width() - 70.0),
+                    );
+                    let browsing_env = matches!(self.dialog_pending, DialogPending::EnvFile(_));
+                    if ui.add_enabled(!browsing_env, egui::Button::new("Browse…")).clicked() {
+                        self.open_env_dialog(&ctx);
+                    }
+                });
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("Opening a .env will auto-fill the API keys below.")
+                        .small()
+                        .weak(),
+                );
+            });
+
+            ui.add_space(8.0);
+
+            // ── Section : API Keys ────────────────────────────────────────
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.label(egui::RichText::new("API Keys").strong());
                 ui.add_space(4.0);
@@ -755,25 +892,34 @@ impl eframe::App for OxywallApp {
                     });
             });
 
+            ui.add_space(8.0);
+
+            // ── Section : dossier de sortie ───────────────────────────────
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(egui::RichText::new("Output folder").strong());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.output_dir)
+                            .hint_text("Wallpaper output directory")
+                            .desired_width(ui.available_width() - 70.0),
+                    );
+                    let browsing_dir = matches!(self.dialog_pending, DialogPending::OutputDir(_));
+                    if ui.add_enabled(!browsing_dir, egui::Button::new("Browse…")).clicked() {
+                        self.open_output_dir_dialog(&ctx);
+                    }
+                });
+            });
+
             ui.add_space(10.0);
 
-            // Get button
+            // ── Bouton Get ────────────────────────────────────────────────
             ui.horizontal(|ui| {
-                let btn_label = if self.is_running {
-                    "⏳ Running…"
-                } else {
-                    "⬇ Get"
-                };
-                let btn = egui::Button::new(
-                    egui::RichText::new(btn_label).size(16.0),
-                );
-                if ui
-                    .add_enabled(!self.is_running, btn)
-                    .clicked()
-                {
+                let btn_label = if self.is_running { "⏳ Running…" } else { "⬇ Get" };
+                let btn = egui::Button::new(egui::RichText::new(btn_label).size(16.0));
+                if ui.add_enabled(!self.is_running, btn).clicked() {
                     self.start_download(&ctx);
                 }
-
                 if self.is_running {
                     ui.spinner();
                 }
@@ -783,7 +929,7 @@ impl eframe::App for OxywallApp {
             ui.separator();
             ui.add_space(4.0);
 
-            // Log output (scrollable)
+            // ── Log ───────────────────────────────────────────────────────
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .stick_to_bottom(true)
@@ -800,7 +946,6 @@ impl eframe::App for OxywallApp {
 // Main
 // -----------------------------------------------------------------------------
 fn main() -> eframe::Result {
-    // Build window icon from embedded PNG
     let icon = {
         let img = image::load_from_memory(LOGO_ICON_PNG)
             .expect("icon decode")
@@ -816,8 +961,8 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!("Oxywall {}", APP_VERSION))
-            .with_inner_size([700.0, 520.0])
-            .with_min_inner_size([480.0, 380.0])
+            .with_inner_size([720.0, 600.0])
+            .with_min_inner_size([500.0, 420.0])
             .with_icon(icon),
         ..Default::default()
     };
