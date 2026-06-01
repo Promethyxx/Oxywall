@@ -3,7 +3,7 @@ use dotenvy::dotenv;
 use eframe::egui;
 use rand::prelude::IndexedRandom;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -572,12 +572,47 @@ fn load_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> egui::TextureH
 }
 
 // -----------------------------------------------------------------------------
+// Config JSON — persistance portable (à côté de l'exe)
+// -----------------------------------------------------------------------------
+#[derive(Serialize, Deserialize, Default)]
+struct AppConfig {
+    output_dir: Option<String>,
+    env_path: Option<String>,
+}
+
+fn config_path() -> PathBuf {
+    env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("oxywall_config.json")))
+        .unwrap_or_else(|| PathBuf::from("oxywall_config.json"))
+}
+
+fn load_config() -> AppConfig {
+    let path = config_path();
+    if !path.exists() {
+        return AppConfig::default();
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_config(cfg: &AppConfig) {
+    let path = config_path();
+    if let Ok(json) = serde_json::to_string_pretty(cfg) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // GUI — état du dialog en cours (non-bloquant)
 // -----------------------------------------------------------------------------
 enum DialogPending {
     None,
     EnvFile(std::sync::Arc<std::sync::Mutex<Option<Option<PathBuf>>>>),
     OutputDir(std::sync::Arc<std::sync::Mutex<Option<Option<PathBuf>>>>),
+    SaveEnv(std::sync::Arc<std::sync::Mutex<Option<Option<PathBuf>>>>),
 }
 
 // -----------------------------------------------------------------------------
@@ -621,10 +656,38 @@ impl OxywallApp {
             .and_then(|p| p.parent().map(|d| d.join("wallpapers")))
             .unwrap_or_else(|| PathBuf::from("wallpapers"));
 
-        // Pré-remplir les clés depuis l'env si déjà définies
-        let pexels_key = env::var("PEXELS_API_KEY").unwrap_or_default();
-        let unsplash_key = env::var("UNSPLASH_API_KEY").unwrap_or_default();
-        let pixabay_key = env::var("PIXABAY_API_KEY").unwrap_or_default();
+        // Charger la config persistée
+        let cfg = load_config();
+        let output_dir = cfg
+            .output_dir
+            .unwrap_or_else(|| default_output.to_string_lossy().into_owned());
+        let env_path = cfg.env_path.unwrap_or_default();
+
+        // Pré-remplir les clés : d'abord depuis le .env sauvegardé, sinon depuis l'env process
+        let mut pexels_key = env::var("PEXELS_API_KEY").unwrap_or_default();
+        let mut unsplash_key = env::var("UNSPLASH_API_KEY").unwrap_or_default();
+        let mut pixabay_key = env::var("PIXABAY_API_KEY").unwrap_or_default();
+
+        if !env_path.is_empty() {
+            let p = Path::new(&env_path);
+            if p.exists() {
+                if let Ok(content) = std::fs::read_to_string(p) {
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if line.starts_with('#') || line.is_empty() { continue; }
+                        if let Some((key, val)) = line.split_once('=') {
+                            let val = val.trim_matches('"').trim_matches('\'').trim();
+                            match key.trim() {
+                                "PEXELS_API_KEY"   => pexels_key   = val.to_string(),
+                                "UNSPLASH_API_KEY" => unsplash_key = val.to_string(),
+                                "PIXABAY_API_KEY"  => pixabay_key  = val.to_string(),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         Self {
             dark_mode: true,
@@ -633,8 +696,8 @@ impl OxywallApp {
             pexels_key,
             unsplash_key,
             pixabay_key,
-            env_path: String::new(),
-            output_dir: default_output.to_string_lossy().into_owned(),
+            env_path,
+            output_dir,
             dialog_pending: DialogPending::None,
             is_running: false,
             log_lines: Vec::new(),
@@ -727,29 +790,85 @@ impl OxywallApp {
         self.dialog_pending = DialogPending::OutputDir(result);
     }
 
+    fn open_save_env_dialog(&mut self, ctx: &egui::Context) {
+        let result: std::sync::Arc<std::sync::Mutex<Option<Option<PathBuf>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result_clone = result.clone();
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("Save .env file")
+                .set_file_name(".env")
+                .save_file();
+            *result_clone.lock().unwrap() = Some(picked);
+            ctx_clone.request_repaint();
+        });
+        self.dialog_pending = DialogPending::SaveEnv(result);
+    }
+
+    fn write_env_file(&mut self, path: &Path) {
+        let content = format!(
+            "PEXELS_API_KEY={}\nUNSPLASH_API_KEY={}\nPIXABAY_API_KEY={}\n",
+            self.pexels_key, self.unsplash_key, self.pixabay_key
+        );
+        if std::fs::write(path, content).is_ok() {
+            self.env_path = path.to_string_lossy().into_owned();
+            self.persist_config();
+            self.log_lines.push(format!("✅ .env saved to {}", path.display()));
+        } else {
+            self.log_lines.push(format!("❌ Failed to write {}", path.display()));
+        }
+    }
+
+    fn persist_config(&self) {
+        save_config(&AppConfig {
+            output_dir: Some(self.output_dir.clone()),
+            env_path: if self.env_path.is_empty() {
+                None
+            } else {
+                Some(self.env_path.clone())
+            },
+        });
+    }
+
     /// Appeler chaque frame pour récupérer le résultat d'un dialog en cours.
     fn poll_dialog(&mut self) {
         let resolved = match &self.dialog_pending {
             DialogPending::None => return,
             DialogPending::EnvFile(arc) => {
                 let guard = arc.lock().unwrap();
-                guard.clone().map(|r| (true, r))
+                guard.clone().map(|r| ("env", r))
             }
             DialogPending::OutputDir(arc) => {
                 let guard = arc.lock().unwrap();
-                guard.clone().map(|r| (false, r))
+                guard.clone().map(|r| ("outdir", r))
+            }
+            DialogPending::SaveEnv(arc) => {
+                let guard = arc.lock().unwrap();
+                guard.clone().map(|r| ("saveenv", r))
             }
         };
 
-        if let Some((is_env, maybe_path)) = resolved {
-            if is_env {
-                if let Some(path) = maybe_path {
-                    self.load_env_file(&path);
+        if let Some((kind, maybe_path)) = resolved {
+            match kind {
+                "env" => {
+                    if let Some(path) = maybe_path {
+                        self.load_env_file(&path);
+                        self.persist_config();
+                    }
                 }
-            } else {
-                if let Some(path) = maybe_path {
-                    self.output_dir = path.to_string_lossy().into_owned();
+                "outdir" => {
+                    if let Some(path) = maybe_path {
+                        self.output_dir = path.to_string_lossy().into_owned();
+                        self.persist_config();
+                    }
                 }
+                "saveenv" => {
+                    if let Some(path) = maybe_path {
+                        self.write_env_file(&path);
+                    }
+                }
+                _ => {}
             }
             self.dialog_pending = DialogPending::None;
         }
@@ -890,6 +1009,32 @@ impl eframe::App for OxywallApp {
                         }
                         ui.end_row();
                     });
+
+                // Bouton Save .env — visible si au moins une clé est renseignée
+                let has_keys = !self.pexels_key.is_empty()
+                    || !self.unsplash_key.is_empty()
+                    || !self.pixabay_key.is_empty();
+                if has_keys {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let saving = matches!(self.dialog_pending, DialogPending::SaveEnv(_));
+                        let btn_label = if self.env_path.is_empty() {
+                            "💾 Save .env…"
+                        } else {
+                            "💾 Update .env…"
+                        };
+                        if ui.add_enabled(!saving, egui::Button::new(btn_label)).clicked() {
+                            self.open_save_env_dialog(&ctx);
+                        }
+                        if !self.env_path.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("→ {}", self.env_path))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                    });
+                }
             });
 
             ui.add_space(8.0);
