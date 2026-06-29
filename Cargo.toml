@@ -10,7 +10,7 @@ build = "build.rs"
 
 anyhow = "1"
 dotenvy = "0.15"
-eframe = "0.34"
+eframe = "0.35"
 image = { version = "0.25", features = ["jpeg", "png"] }
 lazy_static = "1"
 rand = "0.10"
