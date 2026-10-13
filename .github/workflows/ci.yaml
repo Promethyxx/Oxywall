@@ -16,10 +16,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
             label: Lin_x64
             artifact_name: Oxywall_Lin_x64
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            label: Lin_arm64
-            artifact_name: Oxywall_Lin_ARM
     runs-on: ${{ matrix.os }}
     name: Build ${{ matrix.label }}
     steps:
@@ -58,8 +54,65 @@ jobs:
       with:
         name: binary-${{ matrix.label }}
         path: ${{ matrix.artifact_name }}
-  release:
+  flatpak:
     needs: build
+    runs-on: ubuntu-latest
+    name: Package Flatpak
+    steps:
+    - name: Download Linux binary
+      uses: actions/download-artifact@v4
+      with:
+        name: binary-Lin_x64
+    - name: Install Flatpak tooling
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y flatpak flatpak-builder
+        flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+    - name: Write manifest
+      run: |
+        cat > io.github.Promethyxx.Oxywall.json <<'EOF'
+        {
+          "app-id": "io.github.Promethyxx.Oxywall",
+          "runtime": "org.freedesktop.Platform",
+          "runtime-version": "24.08",
+          "sdk": "org.freedesktop.Sdk",
+          "command": "Oxywall",
+          "finish-args": [
+            "--share=network",
+            "--share=ipc",
+            "--socket=wayland",
+            "--socket=fallback-x11",
+            "--device=dri",
+            "--filesystem=home"
+          ],
+          "modules": [
+            {
+              "name": "oxywall",
+              "buildsystem": "simple",
+              "build-commands": [
+                "install -Dm755 Oxywall_Lin_x64 /app/bin/Oxywall"
+              ],
+              "sources": [
+                {
+                  "type": "file",
+                  "path": "Oxywall_Lin_x64"
+                }
+              ]
+            }
+          ]
+        }
+        EOF
+    - name: Build Flatpak
+      run: |
+        flatpak-builder --user --force-clean --install-deps-from=flathub --repo=repo build-dir io.github.Promethyxx.Oxywall.json
+        flatpak build-bundle repo Oxywall_Lin_x64.flatpak io.github.Promethyxx.Oxywall
+    - name: Upload Flatpak
+      uses: actions/upload-artifact@v4
+      with:
+        name: flatpak-Lin_x64
+        path: Oxywall_Lin_x64.flatpak
+  release:
+    needs: [build, flatpak]
     runs-on: ubuntu-latest
     name: Release
     steps:
@@ -82,12 +135,10 @@ jobs:
           ## Platforms
           | Platform | Oxywall | Name |
           |---|:---:|---|
-          | Linux ARM64 | ✅ | Oxywall_Lin_ARM |
-          | Linux x64 | ✅ | Oxywall_Lin_x64 |
+          | Linux x64 (Flatpak) | ✅ | Oxywall_Lin_x64.flatpak |
           | Windows x64 | ✅ | Oxywall_Win_x64.exe |
         files: |
           Oxywall_Win_x64.exe
-          Oxywall_Lin_x64
-          Oxywall_Lin_ARM
+          Oxywall_Lin_x64.flatpak
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

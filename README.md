@@ -8,9 +8,9 @@
 - English
 ---
 ## Platforms
-| | Linux ARM64 | Linux x64 | Mac ARM64 | Windows x64 |
-|---|:---:|:---:|:---:|:---:|
-| Oxywall | ✅ | ✅ | 🛠️ | ✅ |
+|| Linux x64 | Windows x64 |
+|---|:---:|:---:|
+| Oxywall | ✅ | ✅ |
 ---
 ## Building from source
 ### Linux Arm
