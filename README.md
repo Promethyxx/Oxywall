@@ -38,6 +38,8 @@ This project is licensed under the GNU General Public License v3.0 — see Licen
 ## Roadmap
 
 ## 🔴 NOW
+ - oxywall_config
+ - add .env location possibility
  - Security audit and quality control
 ## 🟡 NEXT
  - ### Release:
