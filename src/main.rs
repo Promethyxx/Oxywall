@@ -583,8 +583,8 @@ struct AppConfig {
 fn config_path() -> PathBuf {
     env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("oxywall_config.json")))
-        .unwrap_or_else(|| PathBuf::from("oxywall_config.json"))
+        .and_then(|p| p.parent().map(|d| d.join("oxywall_config").join("config.json")))
+        .unwrap_or_else(|| PathBuf::from("oxywall_config").join("config.json"))
 }
 
 fn load_config() -> AppConfig {
@@ -600,6 +600,9 @@ fn load_config() -> AppConfig {
 
 fn save_config(cfg: &AppConfig) {
     let path = config_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     if let Ok(json) = serde_json::to_string_pretty(cfg) {
         let _ = std::fs::write(path, json);
     }
