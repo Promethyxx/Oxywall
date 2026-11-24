@@ -35,9 +35,7 @@
 This project is licensed under the GNU General Public License v3.0 — see Licenses.md for details.
 
 ---
-## Roadmap
-
-## 🔴 NOW
+# Roadmap
 
 ## 🟢 IN PROGRESS
 - feat: 
