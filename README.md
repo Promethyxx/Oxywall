@@ -38,12 +38,21 @@ This project is licensed under the GNU General Public License v3.0 — see Licen
 ## Roadmap
 
 ## 🔴 NOW
- - add .env location possibility
- - Security audit and quality control
+
+## 🟢 IN PROGRESS
+- feat: 
+  - add .env location possibility
+- chore:
+  - Replace unmaintained crates with maintained alternatives
+  - Add deny.toml
+- docs:
+  - Add CHANGELOG.md
+    - Configure git-cliff
+  - Add SECURITY.md
+
 ## 🟡 NEXT
- - ### Release:
-   - Chocolatey
-   - MS Store
-   - Winget
+- WinGet release
+
 ## 🔵 LATER
----
+- ci:  
+  - Automate WinGet updates through CI pull requests
