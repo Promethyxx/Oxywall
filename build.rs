@@ -2,7 +2,7 @@ fn main() {
     // Windows : attacher l'icône .ico à l'exécutable + supprimer la console en release
     #[cfg(target_os = "windows")]
     {
-        let mut res = winres::WindowsResource::new();
+        let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/Oxywall_icon.ico");
         res.compile().unwrap();
 
